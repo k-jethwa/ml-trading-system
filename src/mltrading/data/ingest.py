@@ -24,7 +24,7 @@ Point-in-time discipline applied here:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -68,7 +68,7 @@ def download_daily_bars(
     and the columns in REQUIRED_COLUMNS. Does not write to disk.
     """
     if ingested_at is None:
-        ingested_at = datetime.now(timezone.utc)
+        ingested_at = datetime.now(UTC)
 
     raw = yf.download(
         tickers=tickers,

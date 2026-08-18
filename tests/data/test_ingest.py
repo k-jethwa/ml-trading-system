@@ -6,7 +6,7 @@ hand-built dataset so the expected output is known exactly.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pandas as pd
@@ -41,7 +41,7 @@ def _fake_ticker(symbol: str):
 @patch("mltrading.data.ingest.yf.Ticker", side_effect=_fake_ticker)
 @patch("mltrading.data.ingest.yf.download", side_effect=_fake_yf_download)
 def test_download_daily_bars_schema_and_values(mock_download, mock_ticker):
-    fixed_ingest_time = datetime(2024, 1, 4, 12, 0, tzinfo=timezone.utc)
+    fixed_ingest_time = datetime(2024, 1, 4, 12, 0, tzinfo=UTC)
 
     df = download_daily_bars(
         tickers=["AAPL", "MSFT"],
