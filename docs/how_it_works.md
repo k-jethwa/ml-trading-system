@@ -4,9 +4,12 @@ This is the project's learning log, in the format `project_spec.md`
 section 15 asks for: for each piece of the system, a plain-language
 definition of the concept, the math/logic behind it, the simplest
 implementation, at least one failure mode or test, and an honest note on
-limitations. It covers everything built so far — data ingestion,
-validation, feature engineering, and target construction — in the order
-the pipeline actually runs.
+limitations. It covers the whole system, in the order the pipeline actually
+runs: data ingestion, validation, feature engineering, target construction
+(§3–§7), then models, walk-forward validation, evaluation metrics, portfolio
+construction, the event-driven backtester with costs, robustness experiments,
+and the systems pieces (§11–§17). Results are summarized in §18 and in full in
+`docs/results.md`; the architecture map is `docs/architecture.md`.
 
 If you're reading this to relearn the material later, each section
 stands mostly on its own; you don't need the earlier sections fresh in
@@ -35,7 +38,7 @@ the winners and short the losers, not long the market.
 
 ---
 
-## 2. Pipeline built so far
+## 2. Pipeline (data → features; the later stages are in §11–§17)
 
 ```text
 yfinance (free, live)
@@ -66,8 +69,9 @@ yfinance (free, live)
    (160,702 rows × 31 columns, ready for model training)
 ```
 
-Not yet built: model training, walk-forward evaluation, portfolio
-construction, backtesting. Those are next — see §9.
+Everything downstream of `features.parquet` (models, walk-forward, portfolio,
+backtest, robustness, serving) is described in §11–§17 and mapped in
+`docs/architecture.md`.
 
 ---
 
@@ -476,7 +480,7 @@ silently invalidate every future result.
   an in-memory DataFrame and returns one — no disk or network I/O inside
   it — specifically so `test_no_lookahead.py` can call it directly on
   synthetic data without needing real ingested files.
-- **19 tests, all synthetic/known-answer, zero network calls.** Every
+- **All tests are synthetic/known-answer with zero network calls (85 across data, features, models, portfolio, backtest and serving).** Every
   check has a hand-computed expected value (e.g. "20-day MA of 19 rows
   of 100 plus one row of 200 should be exactly 105") rather than a vague
   "does it run without crashing" test — per `project_spec.md` section 12
@@ -506,6 +510,10 @@ this data downstream:
 5. **This is v1's fixed, static universe** (55 names) — the spec's
    eventual target is 100–500; this will need revisiting before scaling
    up.
+6. **Modeling, cost and evaluation limitations** added by the later stages
+   (spec deviation on gradient boosting, simplified fills, a short and
+   partly-seen holdout, beta against the universe rather than an index)
+   are listed in `docs/limitations.md` §5–§9.
 
 ---
 
@@ -523,26 +531,256 @@ python -m mltrading.data.validate
 # 3. Build features + target (writes data/processed/features.parquet)
 python -m mltrading.features.build
 
-# Run the full test suite (19 tests, no network calls)
+# 4. Train + evaluate + backtest + robustness checks (writes results/v1/, appends docs/attempt_log.jsonl)
+python -m mltrading.experiments.run --config configs/v1.toml --note "why this run"
+
+# 5. Render tables/figures, benchmark, batch inference, endpoint
+python -m mltrading.experiments.report
+python -m mltrading.experiments.plots              # needs: pip install -e .[viz]
+python -m mltrading.experiments.benchmark --label after --profile
+python -m mltrading.models.infer --model ridge --allow-stale
+python -m mltrading.models.serve --port 8000
+
+# Run the full test suite (85 tests, no network calls)
 python -m pytest -q
 ```
 
 ---
 
-## 11. What's next
+## 11. Stage 5 — Models (`src/mltrading/models/`)
 
-Per the pipeline in `project_spec.md` section 11, the next stage is
-**walk-forward model training**, starting with the simplest possible
-baseline (a constant/mean predictor) before anything more complex — per
-section 7's explicit instruction not to skip straight to a fancier
-model. That means:
+### 11.1 Concept: a model progression, not a model
 
-1. A walk-forward train/test split respecting chronological order (never
-   shuffling across time — the whole point of this exercise is testing
-   whether the model would have worked in real time).
-2. The baseline mean predictor, then linear regression, then ridge, then
-   a gradient-boosted tree (XGBoost/LightGBM) — each one only introduced
-   after the simpler one is recorded as a comparison point.
-3. Evaluation with both ML metrics (MAE, MSE, Spearman rank correlation,
-   information coefficient) and, once a portfolio exists, trading
-   metrics (Sharpe, drawdown, turnover, hit rate).
+**Definition.** A model is a function from the day's features to a score per stock. The spec (§7) requires
+building models in order of complexity and recording each as a benchmark **before** trying the next, so that
+any added complexity has to *earn* its place against something simpler.
+
+| Step | Model | What it tests |
+|---|---|---|
+| 1 | `mean` (constant) | the floor: predicts the training-set mean for every stock |
+| – | `reversal_5d` | a **non-ML** one-liner: score = −(5-day sector-relative return). If an ML model can't beat this, the ML added nothing |
+| 2 | OLS | is there a simple additive linear relationship? |
+| 3 | Ridge (α = 1000) | the same, with an L2 penalty and a scaler |
+| 4 | HGB | gradient-boosted trees: can non-linearity/interactions help? |
+
+**Math (Ridge).** OLS minimizes Σ(yᵢ − xᵢβ)². Ridge adds α‖β‖²: large coefficients are penalized, which
+shrinks estimates toward zero and stabilizes them when features are correlated (several features here are related by construction, e.g. `ret_20d`,
+`dist_ma_20` and `sector_rel_ret_20d`). Because the penalty depends on coefficient size, features must be on a
+common scale; the `StandardScaler` in the pipeline is fit on the **training fold only** (a global scaler would leak test-period means and
+variances into training, the spec §13 leakage example; `test_ridge_scaler_is_fit_on_train_only` asserts it).
+
+**Features to the models.** Each feature is replaced by its same-date cross-sectional percentile rank, centered to [−0.5, 0.5]
+(`models/preprocess.py`). That removes scale differences (a 5-day return is ~0.02, dollar volume ~10⁹) and non-stationarity (dollar volume
+trends up for a decade) without fitting anything across time, so nothing can leak.
+
+**Deviation from the spec (disclosed).** §7 names XGBoost or LightGBM. Both need the system OpenMP library (`brew install libomp`), which this machine does not
+have and I did not install without asking. `HistGradientBoostingRegressor` from scikit-learn is the same family (histogram-binned gradient-boosted trees) and
+ships its own OpenMP. Swapping is a change in one factory function (`models/zoo.py`).
+
+### 11.2 Failure mode and test
+
+*Overfitting through tuning.* Every hyperparameter is fixed in `configs/v1.toml` before any result and never revisited. HGB is deliberately weak
+and heavily regularized (depth 3, 500-sample leaves, learning rate 0.05) because daily return data is mostly noise.
+*Look-ahead through the label.* `X = df[FEATURE_COLUMNS]` cannot include the label: labels live in columns that `FEATURE_COLUMNS` never lists.
+
+### 11.3 Result and conclusion
+
+Full-period rank IC (higher is better): mean —, reversal 0.011, OLS 0.009, Ridge 0.009, HGB 0.014. Only Ridge and OLS have positive out-of-sample R², and only barely
+(+0.01–0.02%); HGB's is −0.24%. None of the ML models is clearly better than the one-line reversal heuristic. Details: `docs/results.md`.
+
+---
+
+## 12. Stage 6 — Walk-forward validation (`models/walk_forward.py`)
+
+**Definition.** Evaluate the way you would have used the model: train on the past, predict the next block of time, then roll forward.
+Never shuffle across time (a shuffled split lets the model train on Tuesday's data to "predict" Monday's).
+
+**Logic.** Expanding window, one retrain per calendar year, first test year 2019 (train 2016–2018), through 2026:
+
+```text
+Train 2016–2018 → Test 2019      Train 2016–2019 → Test 2020   ...   Train 2016–2024 → Test 2025   Train 2016–2025 → Test 2026 (partial)
+```
+
+**The purge.** The label at date *t* is the return from *t* to *t+5* trading days. A training row dated *t = test_start − 3* has a label
+that spans three days *inside* the test window, so the model would have "seen" test-period returns. Each fold therefore drops the last
+5 trading dates before the test start from training. `test_no_training_label_window_reaches_test_period` asserts that the
+label window of the last training row ends strictly before the test start, and `test_folds_are_chronological_and_purged` asserts exactly 5
+dates sit between them.
+
+**Holdout discipline.** Test years 2019–2024 are *development*; 2025-01-01 onward is the *holdout*, reported separately. That only means something if
+configuration is fixed first and the number of attempts is recorded, which is why every full run appends to `docs/attempt_log.jsonl`
+(and why `docs/results.md` discloses that the holdout was partly seen during smoke testing).
+
+**Failure mode.** Overlapping labels: consecutive dates share 4 of 5 days of return, so daily ICs are strongly autocorrelated and a naive
+t-statistic overstates significance by roughly √5. The system computes t-statistics on every 5th date.
+
+---
+
+## 13. Stage 7 — Evaluation metrics (`models/evaluate.py`)
+
+| Metric | Definition | Why |
+|---|---|---|
+| IC | per-date Pearson correlation of prediction and realized label, averaged over dates | linear agreement |
+| Rank IC | the same with Spearman (ranks) | the headline: the portfolio only uses **order** |
+| MAE / MSE | mean absolute / squared error, pooled | magnitude accuracy |
+| OOS R² | 1 − MSE(model) / MSE(constant predictor) | negative = worse than predicting the mean |
+| Decile spread | mean label of the top predicted decile minus the bottom, per date | closest to what a long/short book earns before costs |
+
+**Ranking versus regression error (ML checkpoint).** They measure different things. HGB has the *highest* full-period rank IC (0.014) and the *worst*
+OOS R² (−0.24%): it orders stocks a little better than chance while being badly wrong about magnitudes. A model can also have good MSE and no ranking
+skill. Picking a model by MSE would have chosen wrongly for a ranked portfolio, and picking by IC alone ignores calibration, which matters for the optimizer
+because it treats predictions as expected returns.
+
+**Why accuracy may not translate into PnL (ML checkpoint).** HGB has the best full-period rank IC but Ridge has the better baseline-portfolio Sharpe
+(0.52 vs 0.27). Reasons visible in this data: PnL depends on the *extremes* of the ranking (6 names per side) rather than the average IC across all 55;
+Ridge's baseline book carries beta 0.60 in a bull market; and costs (≈6% a year) are the same order as the whole edge.
+Tests: perfect predictor → IC = +1, reversed → −1, constant predictions → undefined (`tests/models/test_models.py`).
+
+---
+
+## 14. Stage 8 — Portfolio construction (`src/mltrading/portfolio/`)
+
+### 14.1 Baseline: long the top decile, short the bottom
+
+**Definition.** Rank stocks by predicted return; hold the top 10% long and the bottom 10% short, equal-weight within each side. Long side sums to +1.0 of NAV,
+short side to −1.0: **dollar-neutral** (net exposure 0) with **gross exposure** 2.0 (Σ|weights|). With 55 names that is 6 stocks per side. Ties break by ticker
+so results are deterministic.
+
+**Why "market-neutral" is only approximately true.** Net dollar exposure is zero, but *beta* need not be: if the longs are higher-beta than the shorts the book is
+still long the market. Measured: baseline beta 0.28–0.60. This is the single most important interpretive fact in the results.
+
+### 14.2 Risk-aware: a constrained optimizer
+
+For each rebalance the optimizer solves (cvxpy, Clarabel):
+
+```text
+maximize    αᵀw  −  (γ/2)·H·wᵀΣw  −  c·‖w − w_prev‖₁
+subject to  ‖w‖₁ ≤ 2.0            gross exposure
+            |Σw| ≤ 0.02           net exposure
+            |wᵢ| ≤ 0.10           concentration
+            |Σ_{i∈sector} wᵢ| ≤ 0.10   per-sector net
+            |βᵀw| ≤ 0.05          market beta
+            ‖Fᵀw‖₂ ≤ σ_target/√252    ex-ante volatility ≤ 10%/yr   (Σ = FFᵀ)
+            ‖w − w_prev‖₁ ≤ 0.6   turnover per rebalance
+```
+
+α = model's predicted 5-day sector-relative return; Σ = Ledoit-Wolf shrunk daily covariance of the last 60 days; H = 5 (holding period);
+c = one-way cost as a fraction of notional (5 bp). Each term has a plain meaning: reward predicted return, penalize risk, penalize the *cost of changing the book*
+(so it only trades when the predicted gain exceeds the cost), and hard limits rather than penalties for the things that must never be violated.
+
+**Finance checkpoints touched:** *return* (P/P₀ − 1), *volatility* (σ√252), *correlation/covariance* (Σ, shrunk toward a scaled identity because 60 days for 55 stocks gives a noisy, near-singular sample covariance),
+*beta* (cov(rᵢ, r_m)/var(r_m), against the equal-weight universe since the dataset has no index), *market neutrality* (β ≈ 0, not merely net ≈ 0), *gross/net exposure*, *turnover* (traded notional / NAV).
+
+### 14.3 Tests and failure modes
+
+* every constraint satisfied on random instances; zero alpha → zero position; high costs suppress trading; sector neutrality binds when alpha favors one sector; turnover limit respected;
+* post-solve `check_constraints` runs at every rebalance in the backtest, and a violating book is **rejected** (current book held), never traded;
+* the solver-failure policy: only genuine infeasibility relaxes the turnover limit (flagged); a numerical failure holds the book;
+* **result:** 384/384 rebalances solved optimally, 0 violations, 0 relaxations per model.
+* Limitation: realized beta (0.04–0.10) exceeds the 0.05 ex-ante limit because betas are estimated on 60 noisy days; the constraint controls *estimated* beta.
+
+---
+
+## 15. Stage 9 — Execution, costs and the backtester (`src/mltrading/backtest/`)
+
+### 15.1 Concept
+
+**Definition.** A backtest replays history through the same decision logic you would run live, with explicit assumptions about how orders fill. The
+easiest way to make a strategy look profitable is to let it trade at a price it could not have known.
+
+**Event-driven design.** State changes happen through typed events processed in order:
+
+```text
+MarketEvent(d)  → borrow cost accrues on the overnight book;  yesterday's orders fill at d's OPEN (FillEvents)
+MarkEvent(d)    → mark to d's CLOSE, record NAV
+SignalEvent(d)  → (rebalance days) strategy sees only data ≤ d, returns target weights
+OrderEvent      → sized off d's close, queued for d+1's open
+```
+
+A decision made after the close of *t* can never trade at a price from *t* or earlier; the earliest fill is the next open.
+`test_overnight_gap_gives_no_free_return` builds the classic trap (decide at close 100, opens at 110 tomorrow) and asserts NAV cannot rise on the gap;
+an engine that filled at the decision-day close would show +10%.
+
+### 15.2 The cost model (all explicit, none free)
+
+| Component | Assumption | Mechanism |
+|---|---|---|
+| Commission | 1 bp of traded notional per side | cash debit |
+| Bid/ask spread | 2 bp half-spread per side | buys pay mid×(1+…), sells receive mid×(1−…) |
+| Slippage | 2 bp per side | same, added to the spread |
+| Borrow | 50 bp/yr on short market value | accrued daily on the book held overnight |
+| Liquidity | ≤ 5% of 20-day average dollar volume per order | larger orders partially fill |
+| Missing bar | order lapses | counted; next rebalance re-decides |
+| Whole shares | orders truncated to integers | small tracking error vs target |
+
+**Slippage, turnover and drawdown, concretely.** *Slippage* is the gap between the price you decided on and the price you got; here it is a flat 2 bp plus the half-spread.
+*Turnover* is traded notional as a multiple of NAV per year; it is the multiplier that turns a per-trade cost into an annual drag (traded notional already counts each buy and sell once: 116× × 5 bp ≈ 5.8% a year, plus ≈ 0.5% borrow, ≈ 6.3% total).
+*Max drawdown* is the worst peak-to-trough fall of NAV.
+
+### 15.3 Tests (all hand-computed) and a bug they caught
+
+Fill timing; gap-up no free return; long/short P&L (+10% on a 50% long = +50,000); itemized costs on flat prices equal the exact NAV loss; buys pay up and sells receive
+less; borrow accrual; liquidity truncation; lapsed orders; rebalance cadence and liquidation of dropped names; deterministic replay; max-drawdown and Sharpe known answers.
+**Bug caught:** the first borrow accrual ran after the day's fills, so a short opened at the day-2 open was charged for the night before it existed (one extra day of borrow per position).
+The test for the accrual schedule failed (350 ≠ 300) and the accrual moved to the start of the day.
+
+### 15.4 Metrics (`backtest/metrics.py`)
+
+*Net* = after all costs; *gross* = the same P&L with costs added back. Sharpe = mean(daily return)/std × √252 (zero risk-free rate, appropriate for a dollar-neutral book, ignoring cash interest);
+Sortino uses downside deviation; hit rate = fraction of positive days (and of 5-day periods); exposures are averaged daily. **Alpha and beta** come from regressing daily strategy returns on the equal-weight
+universe return: r = α + β·r_m + ε. Alpha is what is left after removing market exposure; it is reported with its t-statistic (|t| < 2 ≈ indistinguishable from zero).
+
+---
+
+## 16. Stage 10 — Robustness experiments (`experiments/`)
+
+Each experiment exists to answer "could this result be an artifact?":
+
+| Experiment | Question | Outcome |
+|---|---|---|
+| Label shuffle | Does the pipeline produce out-of-sample IC from **destroyed** labels? | No: rank IC −0.002 / −0.007 |
+| 20 random-score portfolios | What does the same machinery earn with no information? | net Sharpe −0.71 ± 0.49 (≈ −11%/yr): costs alone are ruinous at this turnover |
+| Cost sweep 0.5×–4× | How fast do costs erase the result? | baseline negative at 2–4×; risk-aware barely positive at 4× |
+| Quantile / rebalance sweep | Is the result a knife-edge of one parameter? | yes: Sharpe 0.13–0.67 across variants, non-monotone |
+| Per-year stability | Is it consistent? | no: rank IC negative in 2019, 2021, 2023 |
+| Alpha/beta split | Is the PnL market exposure? | baseline mostly yes |
+
+**Lesson.** Without the random-portfolio baseline a Sharpe of 0.5 looks fine; with it, you can see that the noise level of this whole setup is ±0.5.
+
+---
+
+## 17. Stage 11 — Systems: registry, inference, serving, observability, profiling
+
+* **Model registry (`models/registry.py`).** `artifacts/<name>/<model_id>/{model.joblib, metadata.json}`, `model_id = name-trainEnd-configHash`. Metadata: feature list + version hash, training window,
+  row count, config hash, data fingerprint, git commit, library versions. Every inference output row carries the `model_id`.
+* **Batch versus online inference.** *Batch* (`models/infer.py`) scores the whole cross-section for the latest date in one call (~5–9 ms for 55 names; 0.18 s for the whole 10-year panel) and is what a daily
+  process would run. The *endpoint* (`models/serve.py`: `/health`, `/predict`, `/metrics`) exposes the same code per request. **Latency** = time for one request (dominated by per-call overhead), **throughput** =
+  rows per second in bulk (~800k/s for HGB). The endpoint caches the loaded model and features to avoid paying load time per request.
+* **Failure handling for stale/missing data (`infer.py`).** Stale data → refuse (503); feature-version mismatch → refuse (409); missing/incomplete tickers → excluded and reported, never filled. Tested.
+* **Deterministic replay.** The backtest is a pure function of (predictions, market data, config); tested by running twice and asserting identical frames. A full re-run on the same config reproduced predictions bit-for-bit.
+* **State persistence.** Predictions, NAV, optimizer logs, metrics and a manifest (config, config hash, git commit, data fingerprint, timings, freshness) are written to `results/<name>/`; models to `artifacts/`.
+* **Observability.** JSON logs; per-stage timers; data-freshness check (at the time of writing the data snapshot is 35 days old, so every run logs a stale-data warning, which is the monitor working); per-model, per-year prediction-distribution
+  statistics to catch drift or degenerate outputs.
+* **Profiling and caching.** `docs/benchmarks.md`: the bottleneck was cvxpy re-canonicalizing an identical problem structure on every rebalance (11 of 15 s). Compiling once (DPP) gave 2.7× per optimization and 1.9× on the
+  backtest. Verifying it also surfaced a formulation problem that unit tests had accepted (solver `optimal_inaccurate`) — see that doc.
+
+---
+
+## 18. Results in one paragraph
+
+See `docs/results.md` (narrative) and `docs/results_tables.md` (generated). The system finds a small ranking signal (rank IC ≈ 0.01) that is unstable across years and mostly a short-term reversal effect; after realistic costs and
+beta adjustment no strategy shows statistically significant alpha, and none beats buying and holding the same stocks in 2019–2026. The risk-aware book is much more cost-robust than the naive decile book; the naive book's
+apparent Sharpe is largely market beta. The valuable outputs are the checks, not the returns.
+
+---
+
+## 19. What's next (Phase 2 candidates, per `project_spec.md` §14)
+
+In rough order of expected value:
+
+1. **Point-in-time universe and sector data** (Norgate/Sharadar or similar) — removes the survivorship and sector-label limitations that bias every number here upward.
+2. **A wider universe (100–500 names).** 55 names give only ~6 per side; the ranking signal cannot diversify. This is likely the biggest lever on both signal-to-noise and turnover.
+3. **Lower-turnover design:** longer holding periods with the cost-aware optimizer; the parameter sweep hints at it but was not used to choose settings.
+4. **Better risk model** (factor model, index/ETF beta rather than a universe average).
+5. **XGBoost/LightGBM** (after `brew install libomp`), and a proper tuning protocol with nested walk-forward validation and a truly untouched holdout.
+6. **Fresh data.** Re-ingest (the current snapshot ends 2026-08-17); note that vendor `adj_close` revisions will change historical values, so treat as a new experiment.
