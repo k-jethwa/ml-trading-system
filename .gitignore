@@ -222,3 +222,10 @@ data/raw/*
 data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
+
+# mltrading experiment outputs: bulky/regenerable (python -m mltrading.experiments.run); the
+# reports under docs/ are the committed record.
+results/*
+!results/.gitkeep
+artifacts/*
+!artifacts/.gitkeep

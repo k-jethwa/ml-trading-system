@@ -1,0 +1,44 @@
+# V1 experiment configuration (project_spec.md section 12: configuration-driven
+# experiments). Every value below was fixed BEFORE looking at any out-of-sample
+# result; nothing here has been tuned on backtest output. See docs/results.md
+# for the attempt log.
+
+name = "v1"
+
+[walk_forward]
+first_test_year = 2019          # train 2016-2018 -> test 2019 (2015 lacks 252d of history for mom_12_1)
+holdout_start = "2025-01-01"    # test periods from here on are the clean holdout
+embargo_days = 5                # = forward-label horizon; purges label overlap at each train/test boundary
+
+[models]
+names = ["mean", "reversal_5d", "ols", "ridge", "hgb"]
+ridge_alpha = 1000.0
+hgb_max_depth = 3
+hgb_learning_rate = 0.05
+hgb_max_iter = 200
+hgb_min_samples_leaf = 500
+hgb_l2_regularization = 1.0
+seed = 0
+
+[portfolio]
+initial_capital = 10_000_000.0
+rebalance_every = 5             # trading days; matches the 5-day label horizon
+quantile = 0.10                 # long top decile / short bottom decile (baseline portfolio)
+
+[costs]
+commission_bps = 1.0            # per side, on traded notional
+half_spread_bps = 2.0           # per side (large-cap US equities, quoted half-spread)
+slippage_bps = 2.0              # per side, market-order price impact / latency allowance
+borrow_bps_annual = 50.0        # on short market value, accrued daily
+adv_participation_cap = 0.05    # an order may not exceed 5% of trailing 20d average daily volume
+
+[risk]
+risk_aversion = 5.0
+max_abs_weight = 0.10
+max_gross = 2.0
+net_tolerance = 0.02            # |net exposure| <= 2% of NAV
+sector_net_limit = 0.10         # |net exposure per sector| <= 10% of NAV
+beta_limit = 0.05               # |portfolio beta to the equal-weight universe| <= 0.05
+target_vol_annual = 0.10        # ex-ante portfolio volatility cap
+turnover_limit = 0.60           # one-way L1 weight change per rebalance, as a fraction of NAV
+cov_lookback = 60
